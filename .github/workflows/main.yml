@@ -61,7 +61,7 @@ jobs:
       - name: Get run_id from mlruns
         run: |
           # Find the experiment directory (usually 0, but could be different)
-          EXPERIMENT_DIR=$(find mlruns -mindepth 1 -maxdepth 1 -type d ! -name ".*" | head -n 1)
+          EXPERIMENT_DIR=$(find mlruns -mindepth 1 -maxdepth 1 -type d ! -name ".*" ! -name "models" ! -name "datasets" | head -n 1)
           
           if [ -z "$EXPERIMENT_DIR" ]; then
             echo "ERROR: No experiment directory found in mlruns!"
@@ -72,17 +72,50 @@ jobs:
           EXPERIMENT_ID=$(basename $EXPERIMENT_DIR)
           echo "EXPERIMENT_ID=$EXPERIMENT_ID" >> $GITHUB_ENV
           
-          # Get the latest run_id
-          RUN_ID=$(find $EXPERIMENT_DIR -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%T@ %p\n" | sort -rn | head -n 1 | awk '{print $2}' | xargs basename)
+          # Get the latest run_id (32-character hex string directories only)
+          # Exclude system directories: .trash, models, datasets
+          RUN_ID=$(find $EXPERIMENT_DIR -mindepth 1 -maxdepth 1 -type d \
+            ! -name ".*" \
+            ! -name "models" \
+            ! -name "datasets" \
+            -printf "%T@ %p\n" | \
+            sort -rn | \
+            head -n 1 | \
+            awk '{print $2}' | \
+            xargs basename)
           
           if [ -z "$RUN_ID" ]; then
             echo "ERROR: No run found in experiment directory!"
+            echo "Available directories in $EXPERIMENT_DIR:"
+            ls -la $EXPERIMENT_DIR
             exit 1
+          fi
+          
+          # Validate that RUN_ID looks like a valid MLflow run ID (32 hex characters)
+          if ! [[ "$RUN_ID" =~ ^[a-f0-9]{32}$ ]]; then
+            echo "WARNING: RUN_ID doesn't look like a valid MLflow run ID: $RUN_ID"
+            echo "Trying to find a valid run ID..."
+            
+            # Try alternative approach: look for directories with meta.yaml
+            RUN_ID=$(find $EXPERIMENT_DIR -mindepth 1 -maxdepth 1 -type d -exec test -f {}/meta.yaml \; -print -quit | xargs basename)
+            
+            if [ -z "$RUN_ID" ]; then
+              echo "ERROR: Could not find a valid run directory!"
+              exit 1
+            fi
           fi
           
           echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
           echo "Latest run_id: $RUN_ID"
           echo "Experiment ID: $EXPERIMENT_ID"
+          
+          # Verify the run directory exists and has expected structure
+          if [ ! -d "mlruns/$EXPERIMENT_ID/$RUN_ID" ]; then
+            echo "ERROR: Run directory does not exist: mlruns/$EXPERIMENT_ID/$RUN_ID"
+            exit 1
+          fi
+          
+          echo "Run directory verified: mlruns/$EXPERIMENT_ID/$RUN_ID"
       
       - name: Check model registration
         run: |
@@ -91,10 +124,14 @@ jobs:
           find mlruns/$EXPERIMENT_ID/$RUN_ID -type f
           echo ""
           
-          # Check if there's a registered model we can use
-          if [ -f "mlruns/$EXPERIMENT_ID/$RUN_ID/outputs/m-*/meta.yaml" ]; then
-            echo "Found model metadata in outputs"
-            cat mlruns/$EXPERIMENT_ID/$RUN_ID/outputs/m-*/meta.yaml
+          # Check if model artifact exists
+          if [ -d "mlruns/$EXPERIMENT_ID/$RUN_ID/artifacts/model" ]; then
+            echo "✓ Model artifacts found"
+            ls -la mlruns/$EXPERIMENT_ID/$RUN_ID/artifacts/model/
+          else
+            echo "✗ Model artifacts NOT found!"
+            echo "Available artifacts:"
+            ls -la mlruns/$EXPERIMENT_ID/$RUN_ID/artifacts/ || echo "No artifacts directory"
           fi
           
       - name: Register model to Model Registry
@@ -110,23 +147,40 @@ jobs:
           experiment_id = os.getenv("EXPERIMENT_ID")
           
           print(f"Attempting to register model from run: {run_id}")
+          print(f"Experiment ID: {experiment_id}")
+          print(f"Tracking URI: {os.getenv('MLFLOW_TRACKING_URI')}")
+          
+          # Verify the run exists
+          client = mlflow.tracking.MlflowClient()
+          try:
+              run = client.get_run(run_id)
+              print(f"✓ Run found: {run.info.run_id}")
+              print(f"  Status: {run.info.status}")
+              print(f"  Artifact URI: {run.info.artifact_uri}")
+          except Exception as e:
+              print(f"✗ Failed to get run: {e}")
+              raise
           
           # Try to register the model
           try:
               # Register model using runs:/ URI
               model_uri = f"runs:/{run_id}/model"
+              print(f"Registering model from: {model_uri}")
+              
               result = mlflow.register_model(model_uri, "mobile_price_model")
-              print(f"Model registered successfully: {result}")
-              print(f"Model name: {result.name}")
-              print(f"Model version: {result.version}")
+              print(f"✓ Model registered successfully!")
+              print(f"  Model name: {result.name}")
+              print(f"  Model version: {result.version}")
               
               # Save for next step
               with open("model_info.txt", "w") as f:
                   f.write(f"{result.name}\n{result.version}")
               
           except Exception as e:
-              print(f"Failed to register with runs:/ URI: {e}")
-              print("This likely means the model wasn't logged properly in the training script")
+              print(f"✗ Failed to register model: {e}")
+              print("\nDebugging information:")
+              print(f"  Run ID: {run_id}")
+              print(f"  Model URI: {model_uri}")
               raise
           EOF
           
