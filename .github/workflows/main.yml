@@ -1,0 +1,157 @@
+name: CI/CD MLflow
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CSV_URL: "MLproject/train_mobile_processed.csv"
+  TARGET_VAR: "price_range"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python 3.12.7
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12.7"
+       
+      - name: Check Env
+        run: |
+          echo $CSV_URL
+       
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow scikit-learn pandas numpy
+      
+      - name: Configure MLflow to use file-based tracking
+        run: |
+          # Remove any existing mlflow.db to force file-based tracking
+          rm -f mlflow.db
+          # Set tracking URI to use file-based backend
+          export MLFLOW_TRACKING_URI=file://$(pwd)/mlruns
+          echo "MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI" >> $GITHUB_ENV
+          echo "MLflow will use file-based tracking at: $MLFLOW_TRACKING_URI"
+      
+      - name: Run mlflow project
+        run: |
+          mlflow run MLproject --env-manager=local
+      
+      - name: Debug - Check mlruns structure
+        run: |
+          echo "=== mlruns directory structure ==="
+          if [ -d "mlruns" ]; then
+            find mlruns -type d
+            echo ""
+            echo "=== All files in mlruns ==="
+            find mlruns -type f | head -30
+          else
+            echo "mlruns directory not found!"
+            exit 1
+          fi
+      
+      - name: Get run_id from mlruns
+        run: |
+          # Find the experiment directory (usually 0, but could be different)
+          EXPERIMENT_DIR=$(find mlruns -mindepth 1 -maxdepth 1 -type d ! -name ".*" | head -n 1)
+          
+          if [ -z "$EXPERIMENT_DIR" ]; then
+            echo "ERROR: No experiment directory found in mlruns!"
+            exit 1
+          fi
+          
+          echo "Found experiment directory: $EXPERIMENT_DIR"
+          EXPERIMENT_ID=$(basename $EXPERIMENT_DIR)
+          echo "EXPERIMENT_ID=$EXPERIMENT_ID" >> $GITHUB_ENV
+          
+          # Get the latest run_id
+          RUN_ID=$(find $EXPERIMENT_DIR -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%T@ %p\n" | sort -rn | head -n 1 | awk '{print $2}' | xargs basename)
+          
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: No run found in experiment directory!"
+            exit 1
+          fi
+          
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+          echo "Latest run_id: $RUN_ID"
+          echo "Experiment ID: $EXPERIMENT_ID"
+      
+      - name: Check model registration
+        run: |
+          echo "Checking what was logged in the run..."
+          echo "=== Run directory contents ==="
+          find mlruns/$EXPERIMENT_ID/$RUN_ID -type f
+          echo ""
+          
+          # Check if there's a registered model we can use
+          if [ -f "mlruns/$EXPERIMENT_ID/$RUN_ID/outputs/m-*/meta.yaml" ]; then
+            echo "Found model metadata in outputs"
+            cat mlruns/$EXPERIMENT_ID/$RUN_ID/outputs/m-*/meta.yaml
+          fi
+          
+      - name: Register model to Model Registry
+        run: |
+          python << EOF
+          import mlflow
+          import os
+          
+          # Set tracking URI
+          mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+          
+          run_id = os.getenv("RUN_ID")
+          experiment_id = os.getenv("EXPERIMENT_ID")
+          
+          print(f"Attempting to register model from run: {run_id}")
+          
+          # Try to register the model
+          try:
+              # Register model using runs:/ URI
+              model_uri = f"runs:/{run_id}/model"
+              result = mlflow.register_model(model_uri, "mobile_price_model")
+              print(f"Model registered successfully: {result}")
+              print(f"Model name: {result.name}")
+              print(f"Model version: {result.version}")
+              
+              # Save for next step
+              with open("model_info.txt", "w") as f:
+                  f.write(f"{result.name}\n{result.version}")
+              
+          except Exception as e:
+              print(f"Failed to register with runs:/ URI: {e}")
+              print("This likely means the model wasn't logged properly in the training script")
+              raise
+          EOF
+          
+      - name: Build Docker Model from Registry
+        run: |
+          # Read model info
+          MODEL_NAME=$(head -n 1 model_info.txt)
+          MODEL_VERSION=$(tail -n 1 model_info.txt)
+          
+          echo "Building Docker image from registered model: $MODEL_NAME version $MODEL_VERSION"
+          
+          mlflow models build-docker \
+            --model-uri "models:/$MODEL_NAME/$MODEL_VERSION" \
+            --name "cc"
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      
+      - name: Tag Docker Image
+        run: |
+          docker tag cc ${{ secrets.DOCKER_HUB_USERNAME }}/cc:latest
+      
+      - name: Push Docker Image
+        run: |
+          docker push ${{ secrets.DOCKER_HUB_USERNAME }}/cc:latest
