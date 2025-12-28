@@ -15,6 +15,7 @@ if __name__ == "__main__":
     if 'MLFLOW_RUN_ID' in os.environ:
         del os.environ['MLFLOW_RUN_ID']
 
+ 
     file_path = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_mobile_processed.csv")
     data = pd.read_csv(file_path)
 
@@ -60,4 +61,5 @@ if __name__ == "__main__":
             sk_model=model,
             artifact_path="model",
             input_example=input_example
+
         )
