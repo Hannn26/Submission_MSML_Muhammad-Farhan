@@ -204,7 +204,7 @@ jobs:
       
       - name: Tag Docker Image
         run: |
-          docker tag cc ${{ secrets.DOCKER_HUB_USERNAME }}/submission:latest
+          docker tag submission ${{ secrets.DOCKER_HUB_USERNAME }}/submission:latest
       
       - name: Push Docker Image
         run: |
